@@ -123,7 +123,7 @@ EXP_ST u8  skip_deterministic,        /* Skip deterministic stages?       */
            auto_changed,              /* Auto-generated tokens changed?   */
            no_cpu_meter_red,          /* Feng shui on the status screen   */
            no_arith,                  /* Skip most arithmetic ops         */
-           shuffle_queue,             /* Shuffle input queue?             */
+           shuffle_queue,             /* Shuffle input queue? 洗牌队列，生成测试用例队列的中间层，用于打乱顺序 */
            bitmap_changed = 1,        /* Time to update bitmap?           */
            qemu_mode,                 /* Running in QEMU mode?            */
            skip_requested,            /* Skip request, via SIGUSR1        */
@@ -142,10 +142,17 @@ static s32 forksrv_pid,               /* PID of the fork server           */
            child_pid = -1,            /* PID of the fuzzed program        */
            out_dir_fd = -1;           /* FD of the lock file              */
 
+// 共享内存存储插桩中经过的边缘
 EXP_ST u8* trace_bits;                /* SHM with instrumentation bitmap  */
 
+// 记录基本块遍历的次数
 static u64 hit_bits[MAP_SIZE];        /* @RB@ Hits to every basic block transition */
 
+/**
+ *  记录还没有到达过的基本块，
+ *  没有在timeout中见过的基本块，
+ *  没有发生crash的基本块
+ */
 EXP_ST u8  virgin_bits[MAP_SIZE],     /* Regions yet untouched by fuzzing */
            virgin_tmout[MAP_SIZE],    /* Bits we haven't seen in tmouts   */
            virgin_crash[MAP_SIZE];    /* Bits we haven't seen in crashes  */
@@ -477,6 +484,7 @@ static inline u32 UR(u32 limit) {
 
 /* Shuffle an array of pointers. Might be slightly biased. */
 
+// 洗牌算法，随机化队列顺序
 static void shuffle_ptrs(void** ptrs, u32 cnt) {
 
   u32 i;
@@ -509,6 +517,7 @@ static void bind_to_free_cpu(void) {
 
   if (cpu_core_count < 2) return;
 
+  // 设置环境变量则不绑定到CPU核心上，不对核心上锁则会被其他进程抢占，影响了效率
   if (getenv("AFL_NO_AFFINITY")) {
 
     WARNF("Not binding to a CPU core (AFL_NO_AFFINITY set).");
@@ -1134,6 +1143,7 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
 
   cycles_wo_finds = 0;
 
+  // TODO: queued_paths是什么呢？
   if (!(queued_paths % 100)) {
 
     q_prev100->next_100 = q;
@@ -1463,6 +1473,7 @@ static const u8 count_class_lookup8[256] = {
 
 };
 
+
 static u16 count_class_lookup16[65536];
 
 
@@ -1538,6 +1549,7 @@ static inline void classify_counts(u32* mem) {
 
 static void remove_shm(void) {
 
+    // 取消共享内存
   shmctl(shm_id, IPC_RMID, NULL);
 
 }
@@ -1666,15 +1678,19 @@ EXP_ST void setup_shm(void) {
 
   u8* shm_str;
 
+  // 如果设置了之前的bitmap，则直接使用，否则新建一块内存
   if (!in_bitmap) memset(virgin_bits, 255, MAP_SIZE);
 
+  // 重置virgin_tmout和virgin_crash，TODO: 这两块是做什么的呢？
   memset(virgin_tmout, 255, MAP_SIZE);
   memset(virgin_crash, 255, MAP_SIZE);
 
+  // 生成共享内存，用于进程间通信
   shm_id = shmget(IPC_PRIVATE, MAP_SIZE, IPC_CREAT | IPC_EXCL | 0600);
 
   if (shm_id < 0) PFATAL("shmget() failed");
 
+  // 登记remove_shm方法，在程序退出时触发，销毁共享内存
   atexit(remove_shm);
 
   shm_str = alloc_printf("%d", shm_id);
@@ -1688,6 +1704,7 @@ EXP_ST void setup_shm(void) {
 
   ck_free(shm_str);
 
+  // 将共享内存中的对象映射到进程中
   trace_bits = shmat(shm_id, NULL, 0);
   
   if (!trace_bits) PFATAL("shmat() failed");
@@ -1707,14 +1724,17 @@ static void setup_post(void) {
 
   ACTF("Loading postprocessor from '%s'...", fn);
 
+  // 根据fn环境变量打开动态链接库dh，看起来作用是提供扩展的接口
   dh = dlopen(fn, RTLD_NOW);
   if (!dh) FATAL("%s", dlerror());
 
+  // 根据名称获得库内函数
   post_handler = dlsym(dh, "afl_postprocess");
   if (!post_handler) FATAL("Symbol 'afl_postprocess' not found.");
 
   /* Do a quick test. It's better to segfault now than later =) */
 
+  // 测试post_handler
   post_handler("hello", &tlen);
 
   OKF("Postprocessor installed successfully.");
@@ -1743,6 +1763,7 @@ static void read_testcases(void) {
      the ordering  of test cases would vary somewhat randomly and would be
      difficult to control. */
 
+  // 按照文件字母顺序读取测试用例，放入nl中，nL_cnt为文件数目
   nl_cnt = scandir(in_dir, &nl, NULL, alphasort);
 
   if (nl_cnt < 0) {
@@ -1759,6 +1780,7 @@ static void read_testcases(void) {
 
   }
 
+  // 洗牌队列存在且测试用例数目大于1？
   if (shuffle_queue && nl_cnt > 1) {
 
     ACTF("Shuffling queue...");
@@ -1766,11 +1788,13 @@ static void read_testcases(void) {
 
   }
 
+  //
   for (i = 0; i < nl_cnt; i++) {
 
     struct stat st;
 
     u8* fn = alloc_printf("%s/%s", in_dir, nl[i]->d_name);
+    //测试过的测试用例将被放入这个目录下，检查后不会重复测试
     u8* dfn = alloc_printf("%s/.state/deterministic_done/%s", in_dir, nl[i]->d_name);
 
     u8  passed_det = 0;
@@ -1799,9 +1823,11 @@ static void read_testcases(void) {
        fuzzing when resuming aborted scans, because it would be pointless
        and probably very time-consuming. */
 
+    // 判断dfn是否存在，若存在说明已测试过，跳过之
     if (!access(dfn, F_OK)) passed_det = 1;
     ck_free(dfn);
 
+    // 添加到测试用例队列中
     add_to_queue(fn, st.st_size, passed_det);
 
   }
@@ -2311,7 +2337,8 @@ EXP_ST void init_forkserver(char** argv) {
 
   if (forksrv_pid < 0) PFATAL("fork() failed");
 
-  if (!forksrv_pid) {
+    // 对fork的子线程进行资源限制等处理
+    if (!forksrv_pid) {
 
     struct rlimit r;
 
@@ -2321,6 +2348,7 @@ EXP_ST void init_forkserver(char** argv) {
     if (!getrlimit(RLIMIT_NOFILE, &r) && r.rlim_cur < FORKSRV_FD + 2) {
 
       r.rlim_cur = FORKSRV_FD + 2;
+      //设置进程可开最大文件数，如果超出最大数将会失败，该值存在在GNU 和 4.4BSD，部分系统没有。
       setrlimit(RLIMIT_NOFILE, &r); /* Ignore errors */
 
     }
@@ -2330,7 +2358,7 @@ EXP_ST void init_forkserver(char** argv) {
       r.rlim_max = r.rlim_cur = ((rlim_t)mem_limit) << 20;
 
 #ifdef RLIMIT_AS
-
+        //设置进程总共可获得的最大内存数
       setrlimit(RLIMIT_AS, &r); /* Ignore errors */
 
 #else
@@ -2351,16 +2379,20 @@ EXP_ST void init_forkserver(char** argv) {
 
     r.rlim_max = r.rlim_cur = 0;
 
+    //设置进程创建core文件大小限制，如果进程结束并且要存储core文件高于该值，那么core文件不会被创建，所以设置这个值为0会保证core文件从不被创建
     setrlimit(RLIMIT_CORE, &r); /* Ignore errors */
 
     /* Isolate the process and configure standard descriptors. If out_file is
        specified, stdin is /dev/null; otherwise, out_fd is cloned instead. */
 
+    // 脱离父进程
     setsid();
 
+    // TODO: 设置进程标准输入，标准输出？
     dup2(dev_null_fd, 1);
     dup2(dev_null_fd, 2);
 
+    // 标准输入也被设置为这个
     if (out_file) {
 
       dup2(dev_null_fd, 0);
@@ -2408,6 +2440,7 @@ EXP_ST void init_forkserver(char** argv) {
                            "allocator_may_return_null=1:"
                            "msan_track_origins=0", 0);
 
+    // 执行目标程序
     execv(target_path, argv);
 
     /* Use a distinctive bitmap signature to tell the parent about execv()
@@ -2881,6 +2914,7 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
   /* Make sure the forkserver is up before we do anything, and let's not
      count its spin-up time toward binary calibration. */
 
+
   if (dumb_mode != 1 && !no_forkserver && !forksrv_pid)
     init_forkserver(argv);
 
@@ -3023,6 +3057,7 @@ static void perform_dry_run(char** argv) {
   u32 cal_failures = 0;
   u8* skip_crashes = getenv("AFL_SKIP_CRASHES");
 
+  // 循环处理模糊测试队列
   while (q) {
 
     u8* use_mem;
@@ -3043,6 +3078,7 @@ static void perform_dry_run(char** argv) {
 
     close(fd);
 
+    //
     res = calibrate_case(argv, q, use_mem, 0, 1);
 
     // @RB@ added these for every queue entry
@@ -8693,6 +8729,7 @@ int main(int argc, char** argv) {
   u32 sync_interval_cnt = 0, seek_to;
   u8  *extras_dir = 0;
   u8  mem_limit_given = 0;
+  // getenv 获得环境变量
   u8  exit_1 = !!getenv("AFL_BENCH_JUST_ONE");
   char** use_argv;
 
@@ -8706,9 +8743,15 @@ int main(int argc, char** argv) {
 
   doc_path = access(DOC_PATH, F_OK) ? "docs" : DOC_PATH;
 
+  /**
+   * 使用当前时间随机一个种子
+   */
   gettimeofday(&tv, &tz);
   srandom(tv.tv_sec ^ tv.tv_usec ^ getpid());
 
+  /**
+   * 从命令行循环获得选项，初始化若干变量
+   */
   while ((opt = getopt(argc, argv, "+bq:rsi:o:f:m:t:T:dnCB:S:M:x:Q")) > 0)
 
     switch (opt) {
@@ -8729,15 +8772,22 @@ int main(int argc, char** argv) {
         run_with_shadow = 1;
         break;
 
+        /**
+         * 指定输入测试用例目录
+         */
       case 'i': /* input dir */
 
         if (in_dir) FATAL("Multiple -i options not supported");
         in_dir = optarg;
 
+        // TODO: 尝试就地恢复？
         if (!strcmp(in_dir, "-")) in_place_resume = 1;
 
         break;
 
+        /**
+         * 指定输出目录
+         */
       case 'o': /* output dir */
 
         if (out_dir) FATAL("Multiple -o options not supported");
@@ -8899,11 +8949,15 @@ int main(int argc, char** argv) {
 
     }
 
+  // 提示可用的选项
   if (optind == argc || !in_dir || !out_dir) usage(argv[0]);
 
+  // 设置信号处理程序，关于程序退出等操作
   setup_signal_handlers();
+  // 检查Address Sanitizer的配置
   check_asan_opts();
 
+  // 检查一些配置有无问题
   if (sync_id) fix_up_sync();
 
   if (!strcmp(in_dir, out_dir))
@@ -8938,56 +8992,84 @@ int main(int argc, char** argv) {
   if (getenv("AFL_LD_PRELOAD"))
     FATAL("Use AFL_PRELOAD instead of AFL_LD_PRELOAD");
 
+  // 保存命令行信息
   save_cmdline(argc, argv);
 
+  // TODO: 不懂
   fix_up_banner(argv[optind]);
 
+  // UI
   check_if_tty();
 
+  // 获得CPU核心数目，并针对执行任务数目给出并发相关的建议
   get_core_count();
 
+  // 是linux才define
 #ifdef HAVE_AFFINITY
+  // 将任务绑定到一个空闲的CPU核心上
   bind_to_free_cpu();
 #endif /* HAVE_AFFINITY */
 
+  // 检查程序奔溃报错是否被其他程序接管，fuzz需要及时拦截测试程序的报错信息
   check_crash_handling();
+  // 检查CPU频率
   check_cpu_governor();
 
+  // 设置后置处理器，提供扩展接口
   setup_post();
+
+  // 设置bitmap相关
   setup_shm();
+
+  // 使用count_class_lookup8初始化count_class_lookup16，TODO:用来做什么？
   init_count_class16();
 
+  // 初始化hit_bits
   memset(hit_bits, 0, sizeof(hit_bits));
+
+  // TODO: 这里的vanilla afl和判断条件是做什么的？
   if (in_place_resume) {
     vanilla_afl = 0;
     init_hit_bits();
   }
 
+  // 设置文件输出路径
   setup_dirs_fds();
+  // 读取测试用例
   read_testcases();
+  // 自动加载语料库
   load_auto();
 
+  // TODO:为输入测试用例分配输出文件
   pivot_inputs();
 
+  // -x 指定额外的语料库的样子
   if (extras_dir) load_extras(extras_dir);
 
+  // 如果没有设置超时时间则设置超时时间？
   if (!timeout_given) find_timeout();
 
+  // 替换输入中的@@
   detect_file_args(argv + optind + 1);
 
+  // 设置输出文件位置
   if (!out_file) setup_stdio_file();
 
+  // 检查可执行文件格式，是否是ELF，是否是shell，是否插桩或使用QEMU模式
   check_binary(argv[optind]);
 
   start_time = get_cur_time();
 
+  // 如果是qemu模式，则重构qemu下的参数
   if (qemu_mode)
     use_argv = get_qemu_argv(argv[0], argv + optind, argc - optind);
   else
     use_argv = argv + optind;
 
+  // 使用初始的测试用例跑一遍程序检查程序是否能够正常执行
   perform_dry_run(use_argv);
 
+  //
   cull_queue();
 
   show_init_stats();
