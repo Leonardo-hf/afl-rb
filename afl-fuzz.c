@@ -2337,7 +2337,7 @@ EXP_ST void init_forkserver(char** argv) {
 
   if (forksrv_pid < 0) PFATAL("fork() failed");
 
-    // 对fork的子线程进行资源限制等处理
+    // fork出一个子进程，该进程作为fork server负责为每次fuzz形成一个子fuzz进程
     if (!forksrv_pid) {
 
     struct rlimit r;
@@ -2440,12 +2440,14 @@ EXP_ST void init_forkserver(char** argv) {
                            "allocator_may_return_null=1:"
                            "msan_track_origins=0", 0);
 
-    // 执行目标程序
+    // 执行目标程序，目标程序不出错是不会返回的，
+    // 这里目标程序第一次执行会成为fork server，在整个fuzz过程中负责生成子进程执行目标程序
     execv(target_path, argv);
 
     /* Use a distinctive bitmap signature to tell the parent about execv()
        falling through. */
 
+    // fork server执行出错了，直接退出
     *(u32*)trace_bits = EXEC_FAIL_SIG;
     exit(0);
 
@@ -2464,6 +2466,7 @@ EXP_ST void init_forkserver(char** argv) {
   it.it_value.tv_sec = ((exec_tmout * FORK_WAIT_MULT) / 1000);
   it.it_value.tv_usec = ((exec_tmout * FORK_WAIT_MULT) % 1000) * 1000;
 
+  // 父进程等待fuzz server启动，从管道中读取4byte信息，如果成功则说明fork server成功启动
   setitimer(ITIMER_REAL, &it, NULL);
 
   rlen = read(fsrv_st_fd, &status, 4);
@@ -2480,6 +2483,8 @@ EXP_ST void init_forkserver(char** argv) {
     OKF("All right - fork server is up.");
     return;
   }
+
+  // 后面都是处理可能的错误
 
   if (child_timed_out)
     FATAL("Timeout while initializing fork server (adjusting -t may help)");
@@ -2884,6 +2889,8 @@ static void show_stats(void);
    to warn about flaky or otherwise problematic test cases early on; and when
    new paths are discovered to detect variable behavior and so on. */
 
+// 校验测试用例，评估input文件夹下的case，来发现这些testcase的行为是否异常；
+// 以及在发现新的路径时，用以评估这个新发现的testcase的行为是否是可变
 static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
                          u32 handicap, u8 from_queue) {
 
@@ -2915,21 +2922,26 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
      count its spin-up time toward binary calibration. */
 
 
+  // 启动fork server进程，专门为每次fuzz生成一个子进程负责执行目标程序，TODO：研究fork server的具体逻辑
   if (dumb_mode != 1 && !no_forkserver && !forksrv_pid)
     init_forkserver(argv);
 
+  // 如果不是来自于input文件夹的用例，则将trace_bits复制到first_trace
   if (q->exec_cksum) memcpy(first_trace, trace_bits, MAP_SIZE);
 
   start_us = get_cur_time_us();
 
+  // 反复执行测试用例N多次，查看是否有可变的边缘
   for (stage_cur = 0; stage_cur < stage_max; stage_cur++) {
 
     u32 cksum;
 
     if (!first_run && !(stage_cur % stats_update_freq)) show_stats();
 
+    //
     write_to_testcase(use_mem, q->len);
 
+    // 跑一遍目标程序，此时会更新trace_bits
     fault = run_target(argv, use_tmout);
 
     /* stop_soon is set by the handler for Ctrl+C. When it's pressed,
@@ -2942,19 +2954,25 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
       goto abort_calibration;
     }
 
+    // 计算校验和
     cksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
 
+    // 如果和之前的校验和不相等？
     if (q->exec_cksum != cksum) {
 
+        // 查看是否到达新的基本块，或者只是基本块的经过次数增加
       u8 hnb = has_new_bits(virgin_bits);
+
       if (hnb > new_bits) new_bits = hnb;
 
+      // 如果当前用例已经测试过
       if (q->exec_cksum) {
 
         u32 i;
 
         for (i = 0; i < MAP_SIZE; i++) {
 
+            // var_bytes记录可能可变的路径（相同用例多次执行下到达不同路径）
           if (!var_bytes[i] && first_trace[i] != trace_bits[i]) {
 
             var_bytes[i] = 1;
@@ -2985,7 +3003,9 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
   /* OK, let's collect some stats about the performance of this test case.
      This is used for fuzzing air time calculations in calculate_score(). */
 
+  // 平均执行时间
   q->exec_us     = (stop_us - start_us) / stage_max;
+  // 最后一次执行的bitmap
   q->bitmap_size = count_bytes(trace_bits);
   q->handicap    = handicap;
   q->cal_failed  = 0;
@@ -2993,6 +3013,7 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
   total_bitmap_size += q->bitmap_size;
   total_bitmap_entries++;
 
+  // 更新
   update_bitmap_score(q);
 
   /* If this case didn't result in new output from the instrumentation, tell
@@ -3003,13 +3024,13 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
 
 abort_calibration:
 
+    // 如果重复测试发现了新的边缘
   if (new_bits == 2 && !q->has_new_cov) {
     q->has_new_cov = 1;
     queued_with_cov++;
   }
 
   /* Mark variable paths. */
-
   if (var_detected) {
 
     var_byte_count = count_bytes(var_bytes);
