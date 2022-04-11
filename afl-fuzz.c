@@ -860,6 +860,8 @@ static void mark_as_redundant(struct queue_entry* q, u8 state) {
   u8* fn;
   s32 fd;
 
+  // 这个fs_redundant就是0吧，没看到哪里初始化，传入state为1，表示该测试用例未被偏爱
+  // 此时尝试创建该测试用例的备份
   if (state == q->fs_redundant) return;
 
   q->fs_redundant = state;
@@ -1568,11 +1570,14 @@ static void remove_shm(void) {
 static void update_bitmap_score(struct queue_entry* q) {
 
   u32 i;
+  // 根据执行时间和测试用例的长度判断该测试用例的偏爱程度
   u64 fav_factor = q->exec_us * q->len;
 
   /* For every byte set in trace_bits[], see if there is a previous winner,
      and how it compares to us. */
 
+  // 对该测试用例经过的所有边缘，通过比较偏爱程度判断该测试用例是否是到达该边缘的最优测试用例，
+  // 更新top_rated
   for (i = 0; i < MAP_SIZE; i++)
 
     if (trace_bits[i]) {
@@ -1586,6 +1591,7 @@ static void update_bitmap_score(struct queue_entry* q) {
          /* Looks like we're going to win. Decrease ref count for the
             previous winner, discard its trace_bits[] if necessary. */
 
+         //TODO: 不清楚tc_ref是要做什么
          if (!--top_rated[i]->tc_ref) {
 
           //@RB@ TODO: find a better way to do this
@@ -1622,6 +1628,7 @@ static void update_bitmap_score(struct queue_entry* q) {
 static void cull_queue(void) {
 
   struct queue_entry* q;
+  // 表示该边缘是否被覆盖的位图，是trace_bits的1/8
   static u8 temp_v[MAP_SIZE >> 3];
   u32 i;
 
@@ -1644,7 +1651,10 @@ static void cull_queue(void) {
   /* Let's see if anything in the bitmap isn't captured in temp_v.
      If yes, and if it has a top_rated[] contender, let's use it. */
 
+  // 通过贪心求能够覆盖当前全部边缘的最小测试用例集合，将这些测试用例标志为偏爱
+  // top_rated在update_score中得出
   for (i = 0; i < MAP_SIZE; i++)
+
     if (top_rated[i] && (temp_v[i >> 3] & (1 << (i & 7)))) {
 
       u32 j = MAP_SIZE >> 3;
@@ -1658,6 +1668,7 @@ static void cull_queue(void) {
       top_rated[i]->favored = 1;
       queued_favored++;
 
+      //
       if (!top_rated[i]->was_fuzzed) pending_favored++;
 
     }
@@ -1665,6 +1676,7 @@ static void cull_queue(void) {
   q = queue;
 
   while (q) {
+      // 如果没有被偏爱，则标志该测试用例为冗余，创建其备份
     mark_as_redundant(q, !q->favored);
     q = q->next;
   }
@@ -3013,7 +3025,7 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
   total_bitmap_size += q->bitmap_size;
   total_bitmap_entries++;
 
-  // 更新
+  // 更新top_rated，即更新每条边缘上最佳的测试用例
   update_bitmap_score(q);
 
   /* If this case didn't result in new output from the instrumentation, tell
@@ -3107,6 +3119,7 @@ static void perform_dry_run(char** argv) {
     ck_free(q->trace_mini);
     ck_free(q->fuzzed_branches);
     q->trace_mini = ck_alloc(MAP_SIZE >> 3);
+    // 丢弃计数信息，将trace_bits压缩为位图
     minimize_bits(q->trace_mini, trace_bits);
     q->fuzzed_branches = ck_alloc(MAP_SIZE >>3);
     // @End
@@ -9090,14 +9103,18 @@ int main(int argc, char** argv) {
   // 使用初始的测试用例跑一遍程序检查程序是否能够正常执行
   perform_dry_run(use_argv);
 
-  //
+  // 精简队列
   cull_queue();
 
+  // 就展示一些数据，以及做出可能的警告
   show_init_stats();
 
+  // 恢复模糊测试进程时触发，找到当前测试用例
   seek_to = find_start_position();
 
+  // 写入模糊测试状态到文件fuzzer_stat
   write_stats_file(0, 0, 0);
+
   save_auto();
 
   if (stop_soon) goto stop_fuzzing;
