@@ -301,6 +301,7 @@ static u32 vanilla_afl = 1000;      /* @RB@ How many executions to conduct
 static u32 MAX_RARE_BRANCHES = 256;
 static int rare_branch_exp = 4;        /* @RB@ less than 2^rare_branch_exp is rare*/
 
+// 黑名单，拦截掉部分边缘，不认为其稀有
 static int * blacklist; 
 static int blacklist_size = 1024;
 static int blacklist_pos;
@@ -896,21 +897,28 @@ static int contains_id(int branch_id, int* branch_ids){
 /* you'll have to free the return pointer. */
 static int* get_lowest_hit_branch_ids(){
   int * rare_branch_ids = ck_alloc(sizeof(int) * MAX_RARE_BRANCHES);
+  // 表示所有边缘中的最低稀有度，以此为基准
   int lowest_hob = INT_MAX;
   int ret_list_size = 0;
 
   for (int i = 0; (i < MAP_SIZE) && (ret_list_size < MAX_RARE_BRANCHES - 1); i++){
     // ignore unseen branches. sparse array -> unlikely 
     if (unlikely(hit_bits[i] > 0)){
+        // 跳过blacklist中已有的边缘
       if (contains_id(i, blacklist)) continue;
       unsigned int long cur_hits = hit_bits[i];
+      // 到达该边缘次数，对于2的数量级
       int highest_order_bit = 0;
       while(cur_hits >>=1)
           highest_order_bit++;
+      // Math.min
       lowest_hob = highest_order_bit < lowest_hob ? highest_order_bit : lowest_hob;
+      // 比rare_branch_exp低频的边缘被认为是稀有边缘
       if (highest_order_bit < rare_branch_exp){
         // if we are an order of magnitude smaller, prioritize the
         // rarer branches
+        // 如果发现比rare_branch_exp频率低2倍以上的边缘，则调整rare_branch_exp
+        // 并且认为之前的稀有边缘不稀有
         if (highest_order_bit < rare_branch_exp - 1){
           rare_branch_exp = highest_order_bit + 1;
           // everything else that came before had way more hits
@@ -924,6 +932,7 @@ static int* get_lowest_hit_branch_ids(){
     }
   }
 
+  // 没有找到稀有边缘，调高rare_branch_exp的标准，重新跑一次这个函数
   if (ret_list_size == 0){
     DEBUG1("Was returning list of size 0\n");
     if (lowest_hob != INT_MAX) {
@@ -934,6 +943,7 @@ static int* get_lowest_hit_branch_ids(){
     }
   }
 
+  // 返回稀有路径
   rare_branch_ids[ret_list_size] = -1;
   return rare_branch_ids;
 
@@ -950,13 +960,15 @@ static int hits_branch(int branch_id){
 // else returns a list of all the rare branches hit
 // by the mini trace bits, in decreasing order of rarity
 static u32 * is_rb_hit_mini(u8* trace_bits_mini){
+    // rarest_branches为稀有边缘的集合
   int * rarest_branches = get_lowest_hit_branch_ids();
   u32 * branch_ids = ck_alloc(sizeof(u32) * MAX_RARE_BRANCHES);
   u32 * branch_cts = ck_alloc(sizeof(u32) * MAX_RARE_BRANCHES);
   int min_hit_index = 0;
 
   for (int i = 0; i < MAP_SIZE ; i ++){
-;
+      // 检查测试用例的位图，如果测试用例经过的边缘是稀有边缘，则加入到branch_ids中，
+      // 并且按照branch_cts排序，即按照测试用例对稀有路径的经过次数来排序，次数越少越前
       if (unlikely (trace_bits_mini[i >> 3]  & (1 <<(i & 7)) )){
         int cur_index = i;
         int is_rare = contains_id(cur_index, rarest_branches);
@@ -995,6 +1007,7 @@ static u32 * is_rb_hit_mini(u8* trace_bits_mini){
   }
   ck_free(branch_cts);
   ck_free(rarest_branches);
+  // 如果没有经过稀有路径，则返回NULL
   if (min_hit_index == 0){
       ck_free(branch_ids);
       branch_ids = NULL;
@@ -5495,18 +5508,19 @@ static u8 fuzz_one(char** argv) {
   u32 orig_total_execs = total_execs;
   
 
+    // TODO: 何时触发？
   if (!vanilla_afl){
     if (prev_cycle_wo_new && bootstrap){
       vanilla_afl = 1;
       rb_fuzzing = 0;
       if (bootstrap == 2){
         skip_deterministic_bootstrap = 1;
-
       }
     }
 
   }
 
+  // 快速模糊测试模式，额外跳过alf-rb的一些环节
  if (skip_deterministic){
   rb_skip_deterministic = 1;
   skip_simple_bitflip = 1;
@@ -5521,14 +5535,17 @@ static u8 fuzz_one(char** argv) {
 
 #else
 
+  // 采用原生afl
   if (vanilla_afl){
 
+      // 在cull_queue中每有一个被偏爱的但没被模糊测试过的用例都会让pending_favored+1
     if (pending_favored) {
 
       /* If we have any favored, non-fuzzed new arrivals in the queue,
          possibly skip to them at the expense of already-fuzzed or non-favored
          cases. */
 
+      // 如果当前用例被测试过或者没被偏爱则有99%概率直接跳过（尽快执行没被模糊测试过的偏爱用例）
       if ((queue_cur->was_fuzzed || !queue_cur->favored) &&
           UR(100) < SKIP_TO_NEW_PROB) return 1;
 
@@ -5536,7 +5553,11 @@ static u8 fuzz_one(char** argv) {
 
       /* Otherwise, still possibly skip non-favored cases, albeit less often.
          The odds of skipping stuff are higher for already-fuzzed inputs and
-         lower for never-fuzzed entries. */
+         lower for never-fuzzed entries.
+         不存在没有被模糊测试的被偏爱的用例，
+         不是dumb_mode，并且总的测试用例数目大于10，仍然存在概率跳过不被偏爱的测试用例
+         当测试轮数大于1并且当前用例没有被模糊测试过，则有75%概率跳过
+         否则有95%概率被跳过 */
 
       if (queue_cycle > 1 && !queue_cur->was_fuzzed) {
 
@@ -5554,9 +5575,11 @@ static u8 fuzz_one(char** argv) {
 
 #endif /* ^IGNORE_FINDS */
 
-  /* select inputs which hit rare branches */
+    // 采用afl-rb
+    /* select inputs which hit rare branches */
   if (!vanilla_afl) {
     skip_deterministic_bootstrap = 0;
+    // min_branch_hits是该测试用例经过的稀有边缘，并按照到达次数排序
     u32 * min_branch_hits = is_rb_hit_mini(queue_cur->trace_mini);
 
     if (min_branch_hits == NULL){
@@ -5564,6 +5587,8 @@ static u8 fuzz_one(char** argv) {
       return 1;
     } else { 
       int ii;
+      // 挨个查看稀有边缘是否被fuzz过，若没有被fuzz过，则对这个边缘进行fuzz，
+      // 同时也要检查整个测试用例是否被fuzz过，若fuzz过则跳过bitflap步骤
       for (ii = 0; min_branch_hits[ii] != 0; ii++){
         rb_fuzzing = min_branch_hits[ii];
         if (rb_fuzzing){
@@ -5604,6 +5629,7 @@ static u8 fuzz_one(char** argv) {
       }
       ck_free(min_branch_hits);
 
+      // 没被fuzz过，则设置cycle_wo_new为0
     if (!skip_simple_bitflip){
       cycle_wo_new = 0; 
     }
@@ -8814,7 +8840,7 @@ int main(int argc, char** argv) {
         if (in_dir) FATAL("Multiple -i options not supported");
         in_dir = optarg;
 
-        // TODO: 尝试就地恢复？
+        // 输入等于 "-"，表示试图恢复到之前的模糊测试进度（之前中途退出但中间文件仍然保留，可以尝试恢复）
         if (!strcmp(in_dir, "-")) in_place_resume = 1;
 
         break;
@@ -9061,7 +9087,7 @@ int main(int argc, char** argv) {
   // 初始化hit_bits
   memset(hit_bits, 0, sizeof(hit_bits));
 
-  // TODO: 这里的vanilla afl和判断条件是做什么的？
+  // TODO: 如果尝试恢复，则不使用原生afl？
   if (in_place_resume) {
     vanilla_afl = 0;
     init_hit_bits();
@@ -9130,8 +9156,10 @@ int main(int argc, char** argv) {
   while (1) {
 
     u8 skipped_fuzz;
+
     cull_queue();
 
+    // fuzz 周期
     if (!queue_cur) {
       DEBUG1("Entering new queueing cycle\n");
       if (prev_cycle_wo_new && (bootstrap == 3)){
@@ -9171,11 +9199,13 @@ int main(int argc, char** argv) {
 
       prev_queued = queued_paths;
 
+
       if (sync_id && queue_cycle == 1 && getenv("AFL_IMPORT_FIRST"))
         sync_fuzzers(use_argv);
 
     }
 
+    // 进行一次模糊测试，两千多行是真的离谱
     skipped_fuzz = fuzz_one(use_argv);
 
     if (!stop_soon && sync_id && !skipped_fuzz) {
